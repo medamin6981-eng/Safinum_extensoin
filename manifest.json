@@ -9,8 +9,11 @@
 "scripting"
 ],
 "host_permissions": [
-"<all_urls>"
+"https://api.mymemory.translated.net/*"
 ],
+"background": {
+"service_worker": "background.js"
+},
 "action": {
 "default_popup": "popup.html"
 },
