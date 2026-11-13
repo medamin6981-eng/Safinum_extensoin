@@ -3,7 +3,11 @@ const originalTextNodes = new Map();
 const originalAttributes = new Map();
 const translationCache = new Map();
 const pendingTranslations = new Map();
+const audioButtons = new Set();
+const audioButtonsByElement = new WeakMap();
+const autoSpokenAlerts = new WeakMap();
 const translatableAttributes = ["placeholder", "title", "aria-label"];
+let voiceAlertsEnabled = false;
 const dictionaryEntries = Object.entries(HAUSA_DICTIONARY);
 const exactTranslations = new Map(
   dictionaryEntries.map(([source, translation]) => [source.trim().toLocaleLowerCase("fr"), translation])
@@ -27,6 +31,92 @@ function translateValue(value) {
   }
   return translated;
 }
+
+function isSafeSpeechText(text) {
+  return Boolean(
+    text.trim() &&
+    text.length <= 500 &&
+    !/[\p{N}]|\b(?:FCFA|RIB|IBAN|BIC)\b|https?:\/\/|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/iu.test(text)
+  );
+}
+
+function getSpeakableText(element) {
+  const clone = element.cloneNode(true);
+  clone.querySelectorAll(".btn-audio-safinum").forEach((button) => button.remove());
+  return clone.textContent.replace(/\s+/gu, " ").trim();
+}
+
+function lireTexteFinancier(texte, estPrioritaire = false) {
+  if (!isSafeSpeechText(texte)) return;
+  if (!("speechSynthesis" in window) || typeof SpeechSynthesisUtterance !== "function") {
+    console.warn("La synthèse vocale n'est pas supportée par ce navigateur.");
+    return;
+  }
+
+  if (estPrioritaire) window.speechSynthesis.cancel();
+
+  const utterance = new SpeechSynthesisUtterance(texte);
+  utterance.lang = "ha-NE";
+  utterance.rate = 0.85;
+  utterance.pitch = 1;
+  window.speechSynthesis.speak(utterance);
+}
+
+function ajouterBoutonAudio(element) {
+  const existingButton = audioButtonsByElement.get(element);
+  if (existingButton?.isConnected) return;
+
+  if (
+    element.closest("button, a, input, textarea, select, [contenteditable], [role='button'], script, style, form") ||
+    !isSafeSpeechText(getSpeakableText(element))
+  ) {
+    return;
+  }
+
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "btn-audio-safinum";
+  button.textContent = "🔊";
+  button.title = "Écouter en Haoussa";
+  button.setAttribute("aria-label", "Écouter en Haoussa");
+  button.style.cssText =
+    "margin-left:8px;padding:2px 6px;cursor:pointer;font-size:12px;border-radius:4px;border:1px solid #ccc;background:#f9f9f9";
+  button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    lireTexteFinancier(getSpeakableText(element));
+  });
+
+  element.appendChild(button);
+  audioButtonsByElement.set(element, button);
+  audioButtons.add(button);
+}
+
+function speakPriorityAlert(node, originalText, translatedText) {
+  if (!voiceAlertsEnabled || !/\b(attention|alerte|erreur|avertissement|tsaro|refusé)\b/iu.test(originalText)) {
+    return;
+  }
+
+  const element = node.parentElement;
+  const alertText = `Attention : ${translatedText.trim()}`;
+  if (!isSafeSpeechText(getSpeakableText(element)) || !isSafeSpeechText(alertText) || autoSpokenAlerts.get(element) === alertText) return;
+
+  autoSpokenAlerts.set(element, alertText);
+  lireTexteFinancier(alertText, true);
+}
+
+chrome.storage.local.get({ voiceAlertsEnabled: false }, (settings) => {
+  if (chrome.runtime.lastError) {
+    console.warn("Impossible de charger les préférences vocales:", chrome.runtime.lastError.message);
+    return;
+  }
+  voiceAlertsEnabled = settings.voiceAlertsEnabled === true;
+});
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName === "local" && changes.voiceAlertsEnabled) {
+    voiceAlertsEnabled = changes.voiceAlertsEnabled.newValue === true;
+  }
+});
 
 function canUseTranslationApi(text, contextElement) {
   const trimmed = text.trim();
@@ -120,9 +210,12 @@ async function translateTextNode(node) {
 
   originalTextNodes.set(node, { original, translated });
   node.nodeValue = translated;
+  ajouterBoutonAudio(node.parentElement);
+  speakPriorityAlert(node, original, translated);
 }
 
 async function translateAttribute(element, attribute) {
+  if (element.matches(".btn-audio-safinum")) return;
   const original = element.getAttribute(attribute);
   if (original === null) return;
 
@@ -187,6 +280,8 @@ function restoreOriginalText() {
     }
   }
   originalAttributes.clear();
+  for (const button of audioButtons) button.remove();
+  audioButtons.clear();
 }
 
 function cleanupDetachedTextNodes() {
@@ -195,6 +290,9 @@ function cleanupDetachedTextNodes() {
   }
   for (const [element] of originalAttributes) {
     if (!element.isConnected) originalAttributes.delete(element);
+  }
+  for (const button of audioButtons) {
+    if (!button.isConnected) audioButtons.delete(button);
   }
 }
 
