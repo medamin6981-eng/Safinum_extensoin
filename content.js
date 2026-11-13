@@ -1,341 +1,407 @@
-let isTranslationEnabled = true;
-const originalTextNodes = new Map();
-const originalAttributes = new Map();
-const translationCache = new Map();
-const pendingTranslations = new Map();
-const audioButtons = new Set();
-const audioButtonsByElement = new WeakMap();
-const autoSpokenAlerts = new WeakMap();
-const translatableAttributes = ["placeholder", "title", "aria-label"];
-let voiceAlertsEnabled = false;
-const dictionaryEntries = Object.entries(HAUSA_DICTIONARY);
-const exactTranslations = new Map(
-  dictionaryEntries.map(([source, translation]) => [source.trim().toLocaleLowerCase("fr"), translation])
-);
-const translationEntries = dictionaryEntries
-  .sort(([left], [right]) => right.length - left.length)
-  .map(([source, translation]) => ({
-    pattern: new RegExp(
-      `(^|[^\\p{L}\\p{N}])${source.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?=$|[^\\p{L}\\p{N}])`,
-      "giu"
-    ),
-    translation
-  }));
+// Script injecté dans la page : applique les traductions du moteur au DOM,
+// sans jamais modifier le code source du service financier.
+//
+// Inactif par défaut : rien n'est lu, modifié ou envoyé tant que
+// l'utilisateur n'a pas activé la traduction pour ce site depuis le popup.
+(() => {
+  "use strict";
+  if (globalThis.__safinumHausaContentLoaded) return;
+  globalThis.__safinumHausaContentLoaded = true;
 
-function translateValue(value) {
-  if (isFinancialValue(value)) return value;
-
-  let translated = value;
-  for (const entry of translationEntries) {
-    translated = translated.replace(entry.pattern, (_match, prefix) => prefix + entry.translation);
-  }
-  return translated;
-}
-
-function isSafeSpeechText(text) {
-  return Boolean(
-    text.trim() &&
-    text.length <= 500 &&
-    !/[\p{N}]|\b(?:FCFA|RIB|IBAN|BIC)\b|https?:\/\/|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/iu.test(text)
-  );
-}
-
-function getSpeakableText(element) {
-  const clone = element.cloneNode(true);
-  clone.querySelectorAll(".btn-audio-safinum").forEach((button) => button.remove());
-  return clone.textContent.replace(/\s+/gu, " ").trim();
-}
-
-function lireTexteFinancier(texte, estPrioritaire = false) {
-  if (!isSafeSpeechText(texte)) return;
-  if (!("speechSynthesis" in window) || typeof SpeechSynthesisUtterance !== "function") {
-    console.warn("La synthèse vocale n'est pas supportée par ce navigateur.");
+  const LEXIQUE = globalThis.SAFINUM_HAUSA;
+  const Translator = globalThis.SafinumTranslator;
+  if (!LEXIQUE || !Translator || !document.documentElement) {
+    console.warn("[Safinum] Lexique ou moteur de traduction introuvable.");
     return;
   }
 
-  if (estPrioritaire) window.speechSynthesis.cancel();
+  const SITE_KEY = location.protocol === "file:" ? "file://" : location.origin;
+  const DEFAULT_SETTINGS = { enabledSites: [], machineTranslation: true };
+  const TRANSLATABLE_ATTRIBUTES = ["placeholder", "title", "aria-label"];
+  const NO_TRANSLATE_SELECTOR = "[translate='no'], .notranslate";
+  // Zones jamais traduites : code, saisie utilisateur, et marquage standard translate="no".
+  const SKIP_SELECTOR =
+    "script, style, noscript, template, textarea, code, pre, svg, math, " +
+    `[contenteditable]:not([contenteditable='false']), ${NO_TRANSLATE_SELECTOR}`;
+  const MARKER_ATTRIBUTE = "data-safinum";
+  const SEVERITY = { ok: 1, partial: 2, mt: 3, "mt-critical": 4, kept: 5 };
 
-  const utterance = new SpeechSynthesisUtterance(texte);
-  utterance.lang = "ha-NE";
-  utterance.rate = 0.85;
-  utterance.pitch = 1;
-  window.speechSynthesis.speak(utterance);
-}
+  const textRecords = new Map(); // nœud texte -> { original, translated, kind }
+  const attributeRecords = new Map(); // élément -> Map(attribut -> { original, translated })
+  const markedElements = new Set();
 
-function ajouterBoutonAudio(element) {
-  const existingButton = audioButtonsByElement.get(element);
-  if (existingButton?.isConnected) return;
+  let engine = null;
+  let active = false;
+  let machineEnabled = true;
+  let generation = 0;
+  let cleanupTimer = null;
+  let ui = null;
 
-  if (
-    element.closest("button, a, input, textarea, select, [contenteditable], [role='button'], script, style, form") ||
-    !isSafeSpeechText(getSpeakableText(element))
-  ) {
-    return;
-  }
-
-  const button = document.createElement("button");
-  button.type = "button";
-  button.className = "btn-audio-safinum";
-  button.textContent = "🔊";
-  button.title = "Écouter en Haoussa";
-  button.setAttribute("aria-label", "Écouter en Haoussa");
-  button.style.cssText =
-    "margin-left:8px;padding:2px 6px;cursor:pointer;font-size:12px;border-radius:4px;border:1px solid #ccc;background:#f9f9f9";
-  button.addEventListener("click", (event) => {
-    event.stopPropagation();
-    lireTexteFinancier(getSpeakableText(element));
-  });
-
-  element.appendChild(button);
-  audioButtonsByElement.set(element, button);
-  audioButtons.add(button);
-}
-
-function speakPriorityAlert(node, originalText, translatedText) {
-  if (!voiceAlertsEnabled || !/\b(attention|alerte|erreur|avertissement|tsaro|refusé)\b/iu.test(originalText)) {
-    return;
-  }
-
-  const element = node.parentElement;
-  const alertText = `Attention : ${translatedText.trim()}`;
-  if (!isSafeSpeechText(getSpeakableText(element)) || !isSafeSpeechText(alertText) || autoSpokenAlerts.get(element) === alertText) return;
-
-  autoSpokenAlerts.set(element, alertText);
-  lireTexteFinancier(alertText, true);
-}
-
-chrome.storage.local.get({ voiceAlertsEnabled: false }, (settings) => {
-  if (chrome.runtime.lastError) {
-    console.warn("Impossible de charger les préférences vocales:", chrome.runtime.lastError.message);
-    return;
-  }
-  voiceAlertsEnabled = settings.voiceAlertsEnabled === true;
-});
-
-chrome.storage.onChanged.addListener((changes, areaName) => {
-  if (areaName === "local" && changes.voiceAlertsEnabled) {
-    voiceAlertsEnabled = changes.voiceAlertsEnabled.newValue === true;
-  }
-});
-
-function canUseTranslationApi(text, contextElement) {
-  const trimmed = text.trim();
-  const words = trimmed.split(/\s+/u);
-  if (
-    !trimmed ||
-    trimmed.length > 500 ||
-    /[\p{N}]|\b(?:FCFA|RIB|IBAN|BIC)\b|https?:\/\/|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/iu.test(trimmed) ||
-    words.length < 3
-  ) {
-    return false;
-  }
-  if (contextElement?.closest("input, textarea, select, [contenteditable], script, style")) {
-    return false;
-  }
-  return true;
-}
-
-function requestMyMemoryTranslation(text) {
-  return new Promise((resolve, reject) => {
-    chrome.runtime.sendMessage({ action: "translate_text", text }, (response) => {
-      if (chrome.runtime.lastError) {
-        reject(new Error(chrome.runtime.lastError.message));
-        return;
+  // ---------------------------------------------------------------------------
+  // Traduction automatique (via le service worker, texte déjà masqué)
+  // ---------------------------------------------------------------------------
+  function requestMachineTranslation(maskedText) {
+    if (!machineEnabled) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage({ action: "translate_text", text: maskedText }, (response) => {
+          if (chrome.runtime.lastError || !response || response.error) {
+            resolve(null);
+            return;
+          }
+          resolve(typeof response.translatedText === "string" ? response.translatedText : null);
+        });
+      } catch {
+        resolve(null); // extension rechargée : contexte invalidé
       }
-      if (response?.error) {
-        reject(new Error(response.error));
-        return;
-      }
-      resolve(response?.translatedText || null);
     });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Application au DOM
+  // ---------------------------------------------------------------------------
+  function isSkipped(element) {
+    return !element || Boolean(element.closest(SKIP_SELECTOR));
+  }
+
+  function refreshMarker(element) {
+    if (!element) return;
+    let worst = null;
+    for (const child of element.childNodes) {
+      const record = child.nodeType === Node.TEXT_NODE ? textRecords.get(child) : null;
+      if (record && (!worst || SEVERITY[record.kind] > SEVERITY[worst])) worst = record.kind;
+    }
+    if (worst) {
+      if (element.getAttribute(MARKER_ATTRIBUTE) !== worst) element.setAttribute(MARKER_ATTRIBUTE, worst);
+      markedElements.add(element);
+    } else if (element.hasAttribute(MARKER_ATTRIBUTE)) {
+      element.removeAttribute(MARKER_ATTRIBUTE);
+      markedElements.delete(element);
+    }
+  }
+
+  async function translateTextNode(node) {
+    if (!active || !engine) return;
+    const original = node.nodeValue;
+    if (!original || !original.trim()) return;
+
+    const record = textRecords.get(node);
+    if (record && record.translated === original) return; // notre propre modification
+
+    const parent = node.parentElement;
+    if (isSkipped(parent)) return;
+
+    const currentGeneration = generation;
+    const result = await engine.translate(original, { allowMachine: true });
+    if (!active || currentGeneration !== generation || !node.isConnected || node.nodeValue !== original) {
+      return;
+    }
+
+    if (!result) {
+      if (record) {
+        textRecords.delete(node);
+        refreshMarker(parent);
+      }
+      return;
+    }
+
+    textRecords.set(node, { original, translated: result.text, kind: result.kind });
+    if (result.text !== original) node.nodeValue = result.text;
+    refreshMarker(parent);
+  }
+
+  async function translateAttribute(element, attribute) {
+    if (!active || !engine || element.closest(NO_TRANSLATE_SELECTOR)) return;
+    const original = element.getAttribute(attribute);
+    if (original === null) return;
+
+    let attributes = attributeRecords.get(element);
+    const previous = attributes?.get(attribute);
+    if (previous && previous.translated === original) return;
+
+    // Attributs : uniquement des traductions validées (pas d'infobulle possible).
+    const currentGeneration = generation;
+    const result = await engine.translate(original, { allowMachine: false });
+    if (
+      !active ||
+      currentGeneration !== generation ||
+      !result ||
+      result.kind !== "ok" ||
+      !element.isConnected ||
+      element.getAttribute(attribute) !== original
+    ) {
+      return;
+    }
+
+    if (!attributes) {
+      attributes = new Map();
+      attributeRecords.set(element, attributes);
+    }
+    attributes.set(attribute, { original, translated: result.text });
+    element.setAttribute(attribute, result.text);
+  }
+
+  function translateAttributes(element) {
+    for (const attribute of TRANSLATABLE_ATTRIBUTES) {
+      if (element.hasAttribute(attribute)) void translateAttribute(element, attribute);
+    }
+  }
+
+  function walk(root) {
+    if (root.nodeType === Node.TEXT_NODE) {
+      void translateTextNode(root);
+      return;
+    }
+    if (root.nodeType !== Node.ELEMENT_NODE) return;
+    if (root.matches("textarea")) translateAttributes(root); // placeholder seulement
+    if (isSkipped(root)) return;
+
+    translateAttributes(root);
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        if (node.nodeType === Node.ELEMENT_NODE && node.matches(SKIP_SELECTOR)) {
+          if (node.matches("textarea")) translateAttributes(node);
+          return NodeFilter.FILTER_REJECT;
+        }
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+
+    let node;
+    while ((node = walker.nextNode())) {
+      if (node.nodeType === Node.ELEMENT_NODE) translateAttributes(node);
+      else void translateTextNode(node);
+    }
+  }
+
+  function restorePage() {
+    for (const [node, record] of textRecords) {
+      if (node.isConnected && node.nodeValue === record.translated) node.nodeValue = record.original;
+    }
+    textRecords.clear();
+
+    for (const [element, attributes] of attributeRecords) {
+      if (!element.isConnected) continue;
+      for (const [attribute, record] of attributes) {
+        if (element.getAttribute(attribute) === record.translated) {
+          element.setAttribute(attribute, record.original);
+        }
+      }
+    }
+    attributeRecords.clear();
+
+    for (const element of markedElements) element.removeAttribute(MARKER_ATTRIBUTE);
+    markedElements.clear();
+  }
+
+  function scheduleCleanup() {
+    if (cleanupTimer) return;
+    cleanupTimer = setTimeout(() => {
+      cleanupTimer = null;
+      for (const node of textRecords.keys()) if (!node.isConnected) textRecords.delete(node);
+      for (const element of attributeRecords.keys()) if (!element.isConnected) attributeRecords.delete(element);
+      for (const element of markedElements) if (!element.isConnected) markedElements.delete(element);
+    }, 2000);
+  }
+
+  // Contenu inédit : tout texte ajouté ou modifié après le chargement est traité.
+  const observer = new MutationObserver((mutations) => {
+    if (!active) return;
+    for (const mutation of mutations) {
+      if (mutation.type === "childList") {
+        mutation.addedNodes.forEach(walk);
+      } else if (mutation.type === "characterData") {
+        void translateTextNode(mutation.target);
+      } else if (mutation.type === "attributes") {
+        void translateAttribute(mutation.target, mutation.attributeName);
+      }
+    }
+    scheduleCleanup();
   });
-}
 
-function fetchMyMemoryTranslation(text) {
-  if (translationCache.has(text)) return Promise.resolve(translationCache.get(text));
-  if (pendingTranslations.has(text)) return pendingTranslations.get(text);
-
-  const request = requestMyMemoryTranslation(text)
-    .then((translated) => {
-      if (translated !== null) translationCache.set(text, translated);
-      return translated;
-    })
-    .catch((error) => {
-      console.warn("Erreur de connexion à l'API MyMemory:", error);
-      return null;
-    })
-    .finally(() => pendingTranslations.delete(text));
-
-  pendingTranslations.set(text, request);
-  return request;
-}
-
-async function translateValueHybrid(value, contextElement) {
-  const dictionaryTranslation = translateValue(value);
-  const trimmed = value.trim();
-  const exactTranslation = exactTranslations.get(trimmed.toLocaleLowerCase("fr"));
-  if (exactTranslation !== undefined) {
-    const leadingWhitespace = value.match(/^\s*/u)[0];
-    const trailingWhitespace = value.match(/\s*$/u)[0];
-    return `${leadingWhitespace}${exactTranslation}${trailingWhitespace}`;
-  }
-
-  if (!canUseTranslationApi(value, contextElement)) return dictionaryTranslation;
-
-  const translation = await fetchMyMemoryTranslation(trimmed);
-  if (!translation) return dictionaryTranslation;
-
-  const leadingWhitespace = value.match(/^\s*/u)[0];
-  const trailingWhitespace = value.match(/\s*$/u)[0];
-  return `${leadingWhitespace}${translation}${trailingWhitespace}`;
-}
-
-async function translateTextNode(node) {
-  if (!isTranslationEnabled) return;
-  const original = node.nodeValue;
-  if (original === null) return;
-
-  const previous = originalTextNodes.get(node);
-  if (previous?.translated === original) return;
-
-  const translated = await translateValueHybrid(original, node.parentElement);
-  if (
-    !isTranslationEnabled ||
-    !node.isConnected ||
-    node.nodeValue !== original ||
-    translated === original
-  ) {
-    return;
-  }
-
-  originalTextNodes.set(node, { original, translated });
-  node.nodeValue = translated;
-  ajouterBoutonAudio(node.parentElement);
-  speakPriorityAlert(node, original, translated);
-}
-
-async function translateAttribute(element, attribute) {
-  if (element.matches(".btn-audio-safinum")) return;
-  const original = element.getAttribute(attribute);
-  if (original === null) return;
-
-  let attributes = originalAttributes.get(element);
-  const previous = attributes && attributes.get(attribute);
-  if (previous && original === previous.translated) return;
-
-  const translated = await translateValueHybrid(original, element);
-  if (
-    !isTranslationEnabled ||
-    !element.isConnected ||
-    element.getAttribute(attribute) !== original ||
-    translated === original
-  ) {
-    return;
-  }
-
-  if (!attributes) {
-    attributes = new Map();
-    originalAttributes.set(element, attributes);
-  }
-  attributes.set(attribute, { original, translated });
-  element.setAttribute(attribute, translated);
-}
-
-function translateElement(element) {
-  for (const attribute of translatableAttributes) {
-    void translateAttribute(element, attribute);
-  }
-}
-
-function walkDOM(rootNode) {
-  if (rootNode.nodeType === Node.ELEMENT_NODE) translateElement(rootNode);
-  const walker = document.createTreeWalker(
-    rootNode,
-    NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT
-  );
-  let currentNode;
-  while ((currentNode = walker.nextNode())) {
-    if (currentNode.nodeType === Node.ELEMENT_NODE) {
-      translateElement(currentNode);
-    } else {
-      void translateTextNode(currentNode);
-    }
-  }
-}
-
-function restoreOriginalText() {
-  for (const [node, values] of originalTextNodes) {
-    if (node.isConnected && node.nodeValue === values.translated) {
-      node.nodeValue = values.original;
-    }
-  }
-  originalTextNodes.clear();
-
-  for (const [element, attributes] of originalAttributes) {
-    if (!element.isConnected) continue;
-    for (const [attribute, values] of attributes) {
-      if (element.getAttribute(attribute) === values.translated) {
-        element.setAttribute(attribute, values.original);
+  // ---------------------------------------------------------------------------
+  // Marquage visuel + infobulle « texte original »
+  // ---------------------------------------------------------------------------
+  function createUi() {
+    const style = document.createElement("style");
+    style.id = "safinum-hausa-style";
+    style.textContent = `
+      [${MARKER_ATTRIBUTE}="partial"], [${MARKER_ATTRIBUTE}="mt"] {
+        text-decoration: underline dotted #d97706 !important;
+        text-underline-offset: 3px !important;
       }
-    }
-  }
-  originalAttributes.clear();
-  for (const button of audioButtons) button.remove();
-  audioButtons.clear();
-}
-
-function cleanupDetachedTextNodes() {
-  for (const [node] of originalTextNodes) {
-    if (!node.isConnected) originalTextNodes.delete(node);
-  }
-  for (const [element] of originalAttributes) {
-    if (!element.isConnected) originalAttributes.delete(element);
-  }
-  for (const button of audioButtons) {
-    if (!button.isConnected) audioButtons.delete(button);
-  }
-}
-
-walkDOM(document.body);
-
-const observer = new MutationObserver((mutations) => {
-  for (const mutation of mutations) {
-    if (!isTranslationEnabled) break;
-
-    if (mutation.type === "childList") {
-      for (const node of mutation.addedNodes) {
-        if (node.nodeType === Node.ELEMENT_NODE) walkDOM(node);
-        else if (node.nodeType === Node.TEXT_NODE) void translateTextNode(node);
+      [${MARKER_ATTRIBUTE}="mt-critical"], [${MARKER_ATTRIBUTE}="kept"] {
+        outline: 2px dashed #dc2626 !important;
+        outline-offset: 2px !important;
       }
-    } else if (mutation.type === "characterData") {
-      void translateTextNode(mutation.target);
-    } else if (mutation.type === "attributes") {
-      void translateAttribute(mutation.target, mutation.attributeName);
-    }
-  }
-  cleanupDetachedTextNodes();
-});
-observer.observe(document.body, {
-  attributes: true,
-  attributeFilter: translatableAttributes,
-  characterData: true,
-  childList: true,
-  subtree: true
-});
+    `;
+    (document.head || document.documentElement).appendChild(style);
 
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  if (request.action === "get_translation_state") {
-    sendResponse({ enabled: isTranslationEnabled });
-    return;
+    const host = document.createElement("div");
+    host.id = "safinum-hausa-ui";
+    host.setAttribute("translate", "no");
+    host.style.cssText = "position:fixed;top:0;left:0;width:0;height:0;z-index:2147483647;";
+    const shadow = host.attachShadow({ mode: "closed" });
+    shadow.innerHTML = `
+      <style>
+        .tip { position: fixed; max-width: 320px; padding: 8px 10px; border-radius: 6px;
+          background: #0f172a; color: #f8fafc; font: 12px/1.45 system-ui, sans-serif;
+          box-shadow: 0 6px 20px rgba(0,0,0,.3); pointer-events: none; }
+        .tip[hidden] { display: none; }
+        .orig-label { color: #93c5fd; font-weight: 600; }
+      </style>
+      <div class="tip" role="tooltip" hidden>
+        <span class="orig-label"></span> <span class="orig-text"></span>
+      </div>`;
+    document.documentElement.appendChild(host);
+
+    const tip = shadow.querySelector(".tip");
+    const origLabelEl = shadow.querySelector(".orig-label");
+    const origTextEl = shadow.querySelector(".orig-text");
+    const originalLabel = LEXIQUE.interface?.original || "Original (FR) :";
+    let current = null;
+
+    const originalTextOf = (element) => {
+      let text = "";
+      for (const child of element.childNodes) {
+        if (child.nodeType === Node.TEXT_NODE) {
+          text += textRecords.get(child)?.original ?? child.nodeValue;
+        } else if (child.nodeType === Node.ELEMENT_NODE && !child.matches("script, style")) {
+          text += originalTextOf(child);
+        }
+      }
+      return text;
+    };
+
+    const place = (x, y) => {
+      const width = tip.offsetWidth;
+      const height = tip.offsetHeight;
+      const left = Math.max(8, Math.min(x + 12, window.innerWidth - width - 8));
+      const top = y + 18 + height > window.innerHeight ? Math.max(8, y - height - 12) : y + 18;
+      tip.style.left = `${left}px`;
+      tip.style.top = `${top}px`;
+    };
+
+    const hide = () => {
+      current = null;
+      tip.hidden = true;
+    };
+
+    const show = (element, x, y) => {
+      let original = originalTextOf(element).replace(/\s+/gu, " ").trim();
+      if (original.length > 300) original = `${original.slice(0, 300)}…`;
+
+      current = element;
+      origLabelEl.textContent = originalLabel;
+      origTextEl.textContent = original;
+      tip.hidden = false;
+      place(x, y);
+    };
+
+    const markedFrom = (target) =>
+      target instanceof Element ? target.closest(`[${MARKER_ATTRIBUTE}]`) : null;
+
+    const onMouseOver = (event) => {
+      const element = markedFrom(event.target);
+      if (!element) hide();
+      else if (element !== current) show(element, event.clientX, event.clientY);
+    };
+    const onMouseMove = (event) => {
+      if (current) place(event.clientX, event.clientY);
+    };
+    const onFocusIn = (event) => {
+      const element = markedFrom(event.target);
+      if (!element) {
+        hide();
+        return;
+      }
+      const rect = element.getBoundingClientRect();
+      show(element, rect.left, rect.bottom);
+    };
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") hide();
+    };
+
+    document.addEventListener("mouseover", onMouseOver, true);
+    document.addEventListener("mousemove", onMouseMove, true);
+    document.addEventListener("focusin", onFocusIn, true);
+    document.addEventListener("keydown", onKeyDown, true);
+    window.addEventListener("scroll", hide, true);
+
+    return {
+      remove() {
+        document.removeEventListener("mouseover", onMouseOver, true);
+        document.removeEventListener("mousemove", onMouseMove, true);
+        document.removeEventListener("focusin", onFocusIn, true);
+        document.removeEventListener("keydown", onKeyDown, true);
+        window.removeEventListener("scroll", hide, true);
+        host.remove();
+        style.remove();
+      }
+    };
   }
 
-  if (request.action === "toggle_translation") {
-    isTranslationEnabled = request.enabled === true;
-    if (isTranslationEnabled) {
-      walkDOM(document.body);
-    } else {
-      restoreOriginalText();
-    }
-    sendResponse({ enabled: isTranslationEnabled });
+  // ---------------------------------------------------------------------------
+  // Cycle de vie
+  // ---------------------------------------------------------------------------
+  function start() {
+    if (active || !document.body) return;
+    active = true;
+    engine = Translator.createEngine(LEXIQUE, { machineTranslate: requestMachineTranslation });
+    ui = createUi();
+    walk(document.body);
+    observer.observe(document.body, {
+      attributes: true,
+      attributeFilter: TRANSLATABLE_ATTRIBUTES,
+      characterData: true,
+      childList: true,
+      subtree: true
+    });
   }
-});
+
+  function stop() {
+    if (!active) return;
+    active = false;
+    generation += 1;
+    observer.disconnect();
+    restorePage();
+    ui?.remove();
+    ui = null;
+    engine = null;
+  }
+
+  function applySettings(settings) {
+    const shouldRun = Array.isArray(settings.enabledSites) && settings.enabledSites.includes(SITE_KEY);
+    const nextMachine = settings.machineTranslation !== false;
+    const machineChanged = nextMachine !== machineEnabled;
+    machineEnabled = nextMachine;
+
+    if (!shouldRun) stop();
+    else if (active && machineChanged) {
+      stop();
+      start();
+    } else start();
+  }
+
+  function loadSettings() {
+    chrome.storage.local.get(DEFAULT_SETTINGS, (settings) => {
+      if (chrome.runtime.lastError) {
+        console.warn("[Safinum] Préférences illisibles :", chrome.runtime.lastError.message);
+        return;
+      }
+      applySettings(settings);
+    });
+  }
+
+  chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName === "local" && (changes.enabledSites || changes.machineTranslation)) loadSettings();
+  });
+
+  chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
+    if (request?.action === "safinum_ping") {
+      sendResponse({ active });
+    }
+  });
+
+  loadSettings();
+})();
